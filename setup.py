@@ -1,121 +1,176 @@
+"""
+Hermes Web Search Setup Script
+
+自动配置 Hermes Agent 联网搜索能力。
+支持 Tavily（推荐）和 DuckDuckGo（备用）后端。
+
+用法:
+    python setup.py          # 完整配置（Tavily + 修复 .env 加载）
+    python setup.py --check  # 仅检查当前配置状态
+"""
 import os
 import sys
 import re
-import subprocess
 import logging
 from pathlib import Path
 
-# 设置日志
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger("hermes-search-setup")
 
+SITE_PACKAGES_TOOLS = Path(sys.prefix) / "Lib" / "site-packages" / "tools"
+HERMES_ENV = Path.home() / ".hermes" / ".env"
+CONFIG_YAML = Path.home() / ".hermes" / "config.yaml"
+
+
+def get_hermes_tools_path():
+    """Locate the tools directory in site-packages."""
+    # Try to import tools directly first
+    try:
+        import tools
+        return Path(tools.__file__).parent
+    except ImportError:
+        pass
+
+    # Fallback: search in site-packages
+    for sp in sys.path:
+        tools_dir = Path(sp) / "tools"
+        if tools_dir.exists() and (tools_dir / "web_tools.py").exists():
+            return tools_dir
+
+    return SITE_PACKAGES_TOOLS
+
+
 def patch_file(path, search_pattern, replacement, description):
+    """Apply a patch to a file if the pattern is found and patch not already applied."""
     if not os.path.exists(path):
         logger.error(f"File not found: {path}")
         return False
-    
+
     try:
         content = Path(path).read_text(encoding="utf-8")
         if replacement.strip() in content:
-            logger.info(f"✅ {description} already applied.")
+            logger.info(f"[OK] {description} already applied.")
             return True
-        
+
         if search_pattern in content:
             new_content = content.replace(search_pattern, replacement)
             Path(path).write_text(new_content, encoding="utf-8")
-            logger.info(f"🔧 {description} applied successfully.")
+            logger.info(f"[PATCHED] {description}")
             return True
         else:
-            logger.warning(f"⚠️ Could not find target pattern for: {description}")
+            logger.warning(f"[SKIP] Could not find target pattern for: {description}")
             return False
     except Exception as e:
         logger.error(f"Failed to patch {path}: {e}")
         return False
 
+
+def check_tavily_config():
+    """Check if Tavily is properly configured."""
+    import yaml
+
+    # Check .env
+    env_key = None
+    if HERMES_ENV.exists():
+        for line in HERMES_ENV.read_text(encoding="utf-8").splitlines():
+            if line.startswith("TAVILY_API_KEY="):
+                env_key = line.split("=", 1)[1].strip()
+                break
+
+    # Check config.yaml - use yaml parser for accuracy
+    backend = None
+    if CONFIG_YAML.exists():
+        try:
+            content = CONFIG_YAML.read_text(encoding="utf-8")
+            cfg = yaml.safe_load(content)
+            backend = cfg.get("web", {}).get("backend")
+        except Exception:
+            pass
+
+    return env_key, backend
+
+
+def check_env_loading_patch(web_tools_py):
+    """Check if the .env auto-load patch is applied."""
+    if not web_tools_py.exists():
+        return False
+    content = web_tools_py.read_text(encoding="utf-8")
+    return 'load_dotenv(_hermes_env' in content
+
+
 def main():
-    logger.info("🚀 Starting Hermes Web Search Setup...")
+    import argparse
+    parser = argparse.ArgumentParser(description="Hermes Web Search Setup")
+    parser.add_argument("--check", action="store_true", help="Only check current config status")
+    args = parser.parse_args()
 
-    # 1. 安装必要的 Python 库
-    logger.info("📦 Step 1: Installing dependencies...")
-    try:
-        subprocess.run([sys.executable, "-m", "pip", "install", "duckduckgo-search", "yaml"], check=False)
-    except Exception as e:
-        logger.error(f"Failed to install dependencies: {e}")
+    web_tools_py = get_hermes_tools_path() / "web_tools.py"
 
-    # 2. 定位 Hermes 库路径
-    try:
-        import tools
-        lib_path = Path(tools.__file__).parent
-        web_tools_py = lib_path / "web_tools.py"
-        mcp_tool_py = lib_path / "mcp_tool.py"
-    except ImportError:
-        logger.error("Could not find Hermes 'tools' module. Are you running this via Hermes?")
+    # Check mode
+    if args.check:
+        logger.info("=== Hermes Web Search Configuration Check ===")
+        env_key, backend = check_tavily_config()
+        logger.info(f"  TAVILY_API_KEY in ~/.hermes/.env: {'Yes (hidden)' if env_key else 'No'}")
+        logger.info(f"  web.backend in config.yaml: {backend or 'Not set'}")
+        logger.info(f"  .env auto-load patch: {'Yes' if check_env_loading_patch(web_tools_py) else 'No'}")
         return
 
-    # 3. 应用代码补丁
-    logger.info(f"🛠️ Step 2: Patching Hermes core files at {lib_path}...")
+    logger.info("=== Hermes Web Search Setup ===")
 
-    # 补丁 1: 修复 Windows SIGKILL 崩溃
-    patch_file(
-        mcp_tool_py,
-        "os.kill(pid, _signal.SIGKILL)",
-        "sig = getattr(_signal, 'SIGKILL', _signal.SIGTERM)\n            os.kill(pid, sig)",
-        "Windows SIGKILL Fix"
-    )
+    # Step 1: Check if Tavily API key is provided via env
+    env_key, backend = check_tavily_config()
+    use_tavily = bool(env_key)
 
-    # 补丁 2: 在 web_tools.py 中增加 DDG 支持 (部分关键补丁)
-    if not patch_file(
-        web_tools_py,
-        'if configured in ("parallel", "firecrawl", "tavily", "exa"):',
-        'if configured in ("parallel", "firecrawl", "tavily", "exa", "ddg"):',
-        "Enable 'ddg' as valid backend"
-    ):
-        # 兼容性检查：如果已经是最新版或已被修改
-        pass
-    
-    # 补丁 3: 注入 _ddg_search 函数
-    ddg_search_func = """
-def _ddg_search(query: str, limit: int = 5) -> dict:
-    \"\"\"Search using DuckDuckGo (no key required) and return results as a dict.\"\"\"
-    try:
-        from duckduckgo_search import DDGS
-        with DDGS() as ddgs:
-            results = [r for r in ddgs.text(keywords=query, max_results=limit)]
-            web_results = []
-            for i, r in enumerate(results):
-                web_results.append({
-                    "url": r.get("href", ""),
-                    "title": r.get("title", ""),
-                    "description": r.get("body", ""),
-                    "position": i + 1,
-                })
-            return {"success": True, "data": {"web": web_results}}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
+    if use_tavily:
+        logger.info(f"[INFO] Tavily API key found in ~/.hermes/.env")
+        logger.info("[INFO] Tavily is the preferred backend")
 
-"""
-    if "_ddg_search" not in web_tools_py.read_text(encoding="utf-8"):
-        with open(web_tools_py, "a", encoding="utf-8") as f:
-            f.write(ddg_search_func)
-        logger.info("🔧 Injected _ddg_search implementation.")
+        # Step 2: Ensure .env auto-load patch is applied
+        logger.info(f"[PATCH] Ensuring .env auto-load in {web_tools_py}...")
 
-    # 4. 更新 config.yaml
-    logger.info("📝 Step 3: Updating config.yaml...")
-    hermes_home = Path(os.path.expanduser("~/.hermes"))
-    config_path = hermes_home / "config.yaml"
-    if config_path.exists():
-        try:
-            content = config_path.read_text(encoding="utf-8")
-            if "backend: ddg" not in content:
-                # 简单替换或正则替换
-                new_content = re.sub(r"backend:.*", "backend: ddg", content)
-                config_path.write_text(new_content, encoding="utf-8")
-                logger.info("✅ Set web.backend to 'ddg' in config.yaml.")
-        except Exception as e:
-            logger.error(f"Failed to update config: {e}")
+        dotenv_patch = '''from tools.website_policy import check_website_access
 
-    logger.info("\n✨ Setup complete! Hermes Agent is now search-ready.")
-    logger.info("建议运行 'hermes tools list' 确认 web 工具已启用。")
+logger = logging.getLogger(__name__)
+
+# Load Hermes .env so API keys are available in subprocess / MCP contexts
+try:
+    from pathlib import Path
+    from dotenv import load_dotenv
+    _hermes_env = Path.home() / ".hermes" / ".env"
+    if _hermes_env.exists():
+        load_dotenv(_hermes_env, override=True, encoding="utf-8")
+except Exception:
+    pass
+
+
+# ─── Backend Selection ────────────────────────────────────────────────────────'''
+
+        dotenv_search = '''from tools.website_policy import check_website_access
+
+logger = logging.getLogger(__name__)
+
+
+# ─── Backend Selection ────────────────────────────────────────────────────────'''
+
+        patch_file(str(web_tools_py), dotenv_search, dotenv_patch, ".env auto-load patch")
+
+        # Step 3: Ensure config.yaml has tavily backend
+        if backend != "tavily" and CONFIG_YAML.exists():
+            import yaml
+            content = CONFIG_YAML.read_text(encoding="utf-8")
+            cfg = yaml.safe_load(content)
+            cfg.setdefault("web", {})["backend"] = "tavily"
+            CONFIG_YAML.write_text(yaml.dump(cfg), encoding="utf-8")
+            logger.info("[PATCHED] Set web.backend to 'tavily' in config.yaml")
+
+    else:
+        logger.info("[INFO] No Tavily API key found")
+        logger.info("[INFO] DuckDuckGo MCP server will be used as fallback")
+        logger.info("[INFO] To use Tavily, add TAVILY_API_KEY to ~/.hermes/.env")
+
+    logger.info("\n=== Setup Complete ===")
+    logger.info("Run: hermes tools list | grep web")
+
 
 if __name__ == "__main__":
     main()
